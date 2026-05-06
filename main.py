@@ -16,8 +16,7 @@ from eval import evaluation_detection
 from tensorboardX import SummaryWriter
 from dataset import VideoDataSet
 from models import MYNET, SuppressNet
-from loss_func import cls_loss_func, cls_loss_func_, regress_loss_func
-from loss_func import MultiCrossEntropyLoss
+from loss_func import cls_loss_func, regress_loss_func
 from functools import *
 
 def setup_multi_gpu():
@@ -42,7 +41,6 @@ def train_one_epoch(opt, model, train_dataset, optimizer, warmup=False):
     epoch_cost_reg = 0
     
     total_iter = len(train_dataset)//opt['batch_size']
-    cls_loss = MultiCrossEntropyLoss(focal=True)
     
     for n_iter,(input_data,cls_label,reg_label,_) in enumerate(tqdm(train_loader)):
 
@@ -56,13 +54,11 @@ def train_one_epoch(opt, model, train_dataset, optimizer, warmup=False):
         reg_label = reg_label.cuda()
         
         act_cls, act_reg = model(input_data)
-
-        act_cls.register_hook(partial(cls_loss.collect_grad, cls_label))
         
         cost_reg = 0
         cost_cls = 0
 
-        loss = cls_loss_func_(cls_loss, cls_label, act_cls)
+        loss = cls_loss_func(cls_label, act_cls, use_focal=True)
         cost_cls = loss
             
         epoch_cost_cls += cost_cls.detach().cpu().item()    

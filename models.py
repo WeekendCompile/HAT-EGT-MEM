@@ -23,380 +23,60 @@ class PositionalEncoding(nn.Module):
         return self.dropout(token_embedding + self.pos_embedding[:token_embedding.size(0), :])
 
 
-class AdaptiveSequenceProcessor(nn.Module):
+class DualScaleTemporalEncoder(nn.Module):
     """
-    Unified sequence processor optimized for both short and long sequences.
-    """
-    def __init__(self, embedding_dim, num_heads, dropout, max_span=200, min_span=8):
-        super(AdaptiveSequenceProcessor, self).__init__()
-        self.embedding_dim = embedding_dim
-        self.num_heads = num_heads
-        self.max_span = max_span
-        self.min_span = min_span
-        
-        # Sequence length thresholds
-        self.short_threshold = 16
-        self.long_threshold = 64
-        
-        # Short sequence processing (enhanced for better feature capture)
-        self.short_attention = nn.MultiheadAttention(
-            embed_dim=embedding_dim,
-            num_heads=min(num_heads, 8),  # Increased heads for short sequences
-            dropout=dropout * 0.5,  # Reduced dropout
-            batch_first=False
-        )
-        
-        # Lightweight encoder for short sequences
-        self.short_encoder = nn.TransformerEncoderLayer(
-            d_model=embedding_dim,
-            nhead=min(num_heads, 8),
-            dropout=dropout * 0.5,
-            activation='gelu',
-            batch_first=False
-        )
-        
-        # Long sequence processing (dual-range attention)
-        self.local_attention = nn.MultiheadAttention(
-            embed_dim=embedding_dim,
-            num_heads=num_heads // 2,
-            dropout=dropout,
-            batch_first=False
-        )
-        self.global_attention = nn.MultiheadAttention(
-            embed_dim=embedding_dim,
-            num_heads=num_heads // 2,
-            dropout=dropout,
-            batch_first=False
-        )
-        
-        # Adaptive span prediction
-        self.span_predictor = nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim // 2),
-            nn.GELU(),
-            nn.Linear(embedding_dim // 2, 3),  # short, local, global
-            nn.Softmax(dim=-1)
-        )
-        
-        # Relevance scoring for long sequences
-        self.relevance_scorer = nn.Sequential(
-            nn.Linear(embedding_dim * 2, embedding_dim // 2),
-            nn.GELU(),
-            nn.Linear(embedding_dim // 2, 1),
-            nn.Sigmoid()
-        )
-        
-        # Temporal decay parameters
-        self.temporal_decay_local = nn.Parameter(torch.tensor(0.9))
-        self.temporal_decay_global = nn.Parameter(torch.tensor(0.8))
-        
-        # Feature fusion with enhanced flexibility
-        self.feature_fusion = nn.Sequential(
-            nn.Linear(embedding_dim * 2, embedding_dim),
-            nn.GELU(),
-            nn.LayerNorm(embedding_dim)
-        )
-        
-        # Adaptive gating
-        self.adaptive_gate = nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim),
-            nn.Sigmoid()
-        )
-        
-        self.layer_norm = nn.LayerNorm(embedding_dim)
-        self.dropout = nn.Dropout(dropout)
-        
-    def forward(self, features, memory_bank=None):
-        """
-        Adaptive forward pass that switches between short and long processing.
-        """
-        seq_len, batch_size, dim = features.shape
-        
-        if seq_len <= self.short_threshold:
-            return self._process_short_sequence(features)
-        elif seq_len <= self.long_threshold:
-            return self._process_medium_sequence(features)
-        else:
-            return self._process_long_sequence(features, memory_bank)
-    
-    def _process_short_sequence(self, features):
-        """Enhanced processing for short sequences."""
-        seq_len, batch_size, dim = features.shape
-        
-        # Enhanced self-attention
-        attended_features, attention_weights = self.short_attention(
-            features, features, features
-        )
-        
-        # Lightweight encoder pass
-        encoded_features = self.short_encoder(attended_features)
-        
-        # Apply gating
-        gate_weights = self.adaptive_gate(encoded_features)
-        output = encoded_features * gate_weights
-        
-        # Residual connection and normalization
-        output = self.layer_norm(output + features)
-        
-        return output, attention_weights.mean(dim=1), []
-    
-    def _process_medium_sequence(self, features):
-        """Balanced processing for medium sequences."""
-        seq_len, batch_size, dim = features.shape
-        
-        # Compute context for span prediction
-        context = torch.mean(features, dim=0)
-        span_weights = self.span_predictor(context)
-        
-        # Local attention on recent portion
-        local_span = min(self.min_span * 2, features.shape[0])
-        local_features = features[-local_span:]
-        local_attended, local_attn = self.local_attention(
-            local_features, local_features, local_features
-        )
-        
-        # Global attention on subsampled sequence
-        if features.shape[0] > 16:
-            step = max(1, features.shape[0] // 16)
-            global_features = features[::step]
-            global_attended, global_attn = self.global_attention(
-                global_features, global_features, global_features
-            )
-            
-            # Upsample global features
-            global_upsampled = global_attended.repeat_interleave(step, dim=0)
-            if global_upsampled.shape[0] > features.shape[0]:
-                global_upsampled = global_upsampled[:features.shape[0]]
-            elif global_upsampled.shape[0] < features.shape[0]:
-                padding = features.shape[0] - global_upsampled.shape[0]
-                global_upsampled = torch.cat([
-                    global_upsampled,
-                    global_upsampled[-padding:]
-                ], dim=0)
-        else:
-            global_upsampled = local_attended
-        
-        # Extend local features to match sequence length
-        local_extended = torch.cat([
-            features[:-local_span],
-            local_attended
-        ], dim=0)
-        
-        # Weighted combination with span weights
-        combined = torch.cat([local_extended * span_weights[:, 1:2], 
-                            global_upsampled * span_weights[:, 2:3]], dim=-1)
-        fused_features = self.feature_fusion(combined)
-        
-        # Apply adaptive gating
-        gate_weights = self.adaptive_gate(fused_features)
-        output = fused_features * gate_weights
-        
-        # Residual connection and normalization
-        output = self.layer_norm(output + features)
-        
-        attention_weights = torch.ones(seq_len, batch_size, device=features.device)
-        return output, attention_weights, [local_span]
-    
-    def _process_long_sequence(self, features, memory_bank=None):
-        """Comprehensive processing for long sequences."""
-        seq_len, batch_size, dim = features.shape
-        
-        # Compute adaptive spans
-        context = torch.mean(features, dim=0)
-        span_weights = self.span_predictor(context)
-        
-        # Process each batch separately for efficiency
-        local_features = []
-        global_features = []
-        
-        for b in range(batch_size):
-            # Local processing
-            local_span = min(self.min_span * 4, seq_len)
-            local_history = features[-local_span:, b:b+1, :]
-            
-            if local_history.shape[0] > 0:
-                local_context = context[b:b+1, :].unsqueeze(0).expand(local_history.shape[0], -1, -1)
-                local_combined = torch.cat([local_history, local_context], dim=-1)
-                local_scores = self.relevance_scorer(local_combined).squeeze(-1).squeeze(-1)
-                
-                # Apply temporal decay
-                local_positions = torch.arange(local_history.shape[0], device=features.device, dtype=torch.float)
-                local_decay = self.temporal_decay_local ** (local_history.shape[0] - 1 - local_positions)
-                local_weights = F.softmax(local_scores + torch.log(local_decay + 1e-8), dim=0)
-                
-                local_feat = (local_history.squeeze(1) * local_weights.unsqueeze(-1)).sum(dim=0)
-            else:
-                local_feat = torch.zeros(self.embedding_dim, device=features.device)
-            
-            # Global processing (subsampled)
-            if seq_len > 32:
-                step = max(1, seq_len // 32)
-                global_history = features[::step, b:b+1, :]
-            else:
-                global_history = features[:, b:b+1, :]
-            
-            if global_history.shape[0] > 0:
-                global_context = context[b:b+1, :].unsqueeze(0).expand(global_history.shape[0], -1, -1)
-                global_combined = torch.cat([global_history, global_context], dim=-1)
-                global_scores = self.relevance_scorer(global_combined).squeeze(-1).squeeze(-1)
-                
-                global_positions = torch.arange(global_history.shape[0], device=features.device, dtype=torch.float)
-                global_decay = self.temporal_decay_global ** (global_history.shape[0] - 1 - global_positions)
-                global_weights = F.softmax(global_scores + torch.log(global_decay + 1e-8), dim=0)
-                
-                global_feat = (global_history.squeeze(1) * global_weights.unsqueeze(-1)).sum(dim=0)
-            else:
-                global_feat = torch.zeros(self.embedding_dim, device=features.device)
-            
-            local_features.append(local_feat)
-            global_features.append(global_feat)
-        
-        # Combine features
-        local_stack = torch.stack(local_features, dim=0)
-        global_stack = torch.stack(global_features, dim=0)
-        
-        # Weighted combination based on predicted spans
-        combined = torch.cat([
-            local_stack * span_weights[:, 1:2],  # local weight
-            global_stack * span_weights[:, 2:3]  # global weight
-        ], dim=-1)
-        
-        # Fusion and expansion to sequence length
-        fused = self.feature_fusion(combined)
-        fused_expanded = fused.unsqueeze(0).expand(seq_len, -1, -1)
-        
-        # Apply adaptive gating
-        gate_weights = self.adaptive_gate(fused_expanded)
-        output = fused_expanded * gate_weights
-        
-        # Residual connection and normalization
-        output = self.layer_norm(output + features)
-        
-        attention_weights = torch.ones(seq_len, batch_size, device=features.device) / seq_len
-        actual_spans = [local_span, min(self.max_span, seq_len)]
-        
-        return output, attention_weights, actual_spans
-
-
-class HierarchicalContextEncoder(nn.Module):
-    """
-    Adaptive hierarchical encoder optimized for varying sequence lengths.
+    Unified temporal encoder that captures both fine-grained local motion 
+    and long-range temporal dependencies without relying on sequence-length branching.
     """
     def __init__(self, embedding_dim, num_heads, dropout):
-        super(HierarchicalContextEncoder, self).__init__()
+        super(DualScaleTemporalEncoder, self).__init__()
         
-        # Multi-scale encoders
-        self.fine_encoder = nn.TransformerEncoderLayer(
+        # Local scale: Depthwise 1D Convolutions for short-term temporal dynamics
+        self.local_encoder = nn.Conv1d(
+            in_channels=embedding_dim, 
+            out_channels=embedding_dim, 
+            kernel_size=5, 
+            padding=2, 
+            groups=embedding_dim # Depthwise convolution for efficiency
+        )
+        self.local_norm = nn.LayerNorm(embedding_dim)
+        
+        # Global scale: Transformer Self-Attention for long-range dependencies
+        self.global_encoder = nn.TransformerEncoderLayer(
             d_model=embedding_dim, 
             nhead=num_heads, 
-            dropout=dropout * 0.5,  # Reduced for short sequences
-            activation='gelu',
-            batch_first=False
-        )
-        
-        self.coarse_encoder = nn.TransformerEncoderLayer(
-            d_model=embedding_dim, 
-            nhead=max(1, num_heads // 2), 
             dropout=dropout, 
             activation='gelu',
             batch_first=False
         )
         
-        # Adaptive scale fusion
-        self.scale_fusion = nn.Sequential(
+        # Feature fusion
+        self.fusion = nn.Sequential(
             nn.Linear(embedding_dim * 2, embedding_dim),
             nn.GELU(),
-            nn.LayerNorm(embedding_dim)
+            nn.LayerNorm(embedding_dim),
+            nn.Dropout(dropout)
         )
-        
-        # Dynamic feature weighting for short sequences
-        self.short_weighting = nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim // 2),
-            nn.GELU(),
-            nn.Linear(embedding_dim // 2, 1),
-            nn.Sigmoid()
-        )
-        
-        # Temporal consistency
-        self.temporal_consistency = nn.Conv1d(embedding_dim, embedding_dim, kernel_size=3, padding=1)
-        
-        # Adaptive feature selection
-        self.feature_selector = nn.Sequential(
-            nn.Linear(embedding_dim * 2, embedding_dim // 2),
-            nn.GELU(),
-            nn.Linear(embedding_dim // 2, 2),
-            nn.Softmax(dim=-1)
-        )
-        
-        self.layer_norm = nn.LayerNorm(embedding_dim)
-        self.dropout = nn.Dropout(dropout)
-        
-    def forward(self, features, sequence_length_ratio=1.0):
-        """
-        Adaptive forward pass based on sequence characteristics.
-        """
-        seq_len, batch_size, dim = features.shape
-        
-        # Fine-grained processing
-        fine_features = self.fine_encoder(features)
-        
-        # Enhanced weighting for short sequences
-        if seq_len <= 16:
-            weights = self.short_weighting(fine_features)
-            fine_features = fine_features * weights
-            coarse_upsampled = fine_features
-        else:
-            # Coarse-grained processing (adaptive based on sequence length)
-            downsample_factor = min(4, max(2, seq_len // 16))
-            coarse_features = features.permute(1, 2, 0)  # [batch, dim, seq]
-            coarse_features = F.avg_pool1d(
-                coarse_features, 
-                kernel_size=downsample_factor, 
-                stride=downsample_factor, 
-                padding=0
-            )
-            coarse_features = coarse_features.permute(2, 0, 1)  # [seq//factor, batch, dim]
-            
-            # Encode coarse features
-            coarse_encoded = self.coarse_encoder(coarse_features)
-            
-            # Upsample back to original length
-            coarse_upsampled = coarse_encoded.permute(1, 2, 0)  # [batch, dim, seq//factor]
-            coarse_upsampled = F.interpolate(
-                coarse_upsampled, 
-                size=seq_len, 
-                mode='linear', 
-                align_corners=False
-            )
-            coarse_upsampled = coarse_upsampled.permute(2, 0, 1)  # [seq, batch, dim]
-        
-        # Adaptive feature selection
-        combined_for_selection = torch.cat([fine_features, coarse_upsampled], dim=-1)
-        selection_weights = self.feature_selector(combined_for_selection)
-        
-        # Weighted combination (bias toward fine features for short sequences)
-        selection_weights = selection_weights * torch.tensor([1.5 if seq_len <= 16 else 1.0, 
-                                                            0.5 if seq_len <= 16 else 1.0], 
-                                                            device=features.device).view(1, 1, 2)
-        selected_features = (fine_features * selection_weights[:, :, 0:1] + 
-                           coarse_upsampled * selection_weights[:, :, 1:2])
-        
-        # Temporal consistency for longer sequences
-        if seq_len > 16:
-            consistency_features = selected_features.permute(1, 2, 0)  # [batch, dim, seq]
-            consistency_features = self.temporal_consistency(consistency_features)
-            consistency_features = consistency_features.permute(2, 0, 1)  # [seq, batch, dim]
-            
-            # Fusion
-            fused_features = self.scale_fusion(torch.cat([selected_features, consistency_features], dim=-1))
-        else:
-            fused_features = self.scale_fusion(torch.cat([selected_features, fine_features], dim=-1))
-        
-        # Final normalization
-        output = self.layer_norm(fused_features)
-        output = self.dropout(output)
-        
-        return output
 
+    def forward(self, x):
+        """
+        x shape: [seq_len, batch, dim]
+        """
+        seq_len, batch, dim = x.shape
+        
+        # Local processing
+        local_x = x.permute(1, 2, 0)  # [batch, dim, seq_len]
+        local_x = self.local_encoder(local_x)
+        local_x = local_x.permute(2, 0, 1)  # [seq_len, batch, dim]
+        local_x = self.local_norm(local_x + x)  # Residual connection
+        
+        # Global processing
+        global_x = self.global_encoder(local_x)
+        
+        # Fusion
+        fused = self.fusion(torch.cat([local_x, global_x], dim=-1))
+        
+        return fused
 
 class MYNET(torch.nn.Module):
     def __init__(self, opt):
@@ -415,11 +95,6 @@ class MYNET(torch.nn.Module):
         self.best_loss = 1000000
         self.best_map = 0
         
-        # Sequence length thresholds for adaptive processing
-        self.short_threshold = 16
-        self.medium_threshold = 64
-        self.long_threshold = 128
-        
         # Enhanced feature reduction with dynamic dropout
         self.feature_reduction_rgb = nn.Sequential(
             nn.Linear(self.n_feature//2, n_embedding_dim//2),
@@ -434,25 +109,16 @@ class MYNET(torch.nn.Module):
             nn.Dropout(dropout * 0.5)
         )
         
-        # Adaptive positional encoding
+        # Positional encoding
         self.positional_encoding = PositionalEncoding(
             n_embedding_dim, 
-            dropout=dropout * 0.5,  # Reduced for short sequences
+            dropout=dropout * 0.5,
             maxlen=400,
-            scale_factor=0.5  # Lower frequency for short sequences
+            scale_factor=0.5
         )
         
-        # Unified adaptive sequence processor
-        self.adaptive_processor = AdaptiveSequenceProcessor(
-            embedding_dim=n_embedding_dim,
-            num_heads=n_enc_head,
-            dropout=dropout,
-            max_span=200,
-            min_span=8
-        )
-        
-        # Hierarchical context encoder
-        self.hierarchical_encoder = HierarchicalContextEncoder(
+        # Unified Dual-Scale Temporal Encoder
+        self.temporal_encoder = DualScaleTemporalEncoder(
             embedding_dim=n_embedding_dim,
             num_heads=n_enc_head,
             dropout=dropout
@@ -481,12 +147,7 @@ class MYNET(torch.nn.Module):
             nn.LayerNorm(n_embedding_dim)
         )
         
-        # Context integration
-        self.context_integration = nn.Sequential(
-            nn.Linear(n_embedding_dim * 2, n_embedding_dim),
-            nn.GELU(),
-            nn.LayerNorm(n_embedding_dim)
-        )
+
         
         # Enhanced classification and regression heads
         self.classifier = nn.Sequential(
@@ -504,7 +165,8 @@ class MYNET(torch.nn.Module):
             nn.Linear(n_embedding_dim, 2)
         )
         
-        self.decoder_token = nn.Parameter(torch.zeros(len(self.anchors), 1, n_embedding_dim))
+        self.decoder_token = nn.Parameter(torch.Tensor(len(self.anchors), 1, n_embedding_dim))
+        nn.init.normal_(self.decoder_token, std=0.01)
         
         # Additional normalization layers
         self.norm1 = nn.LayerNorm(n_embedding_dim)
@@ -528,48 +190,13 @@ class MYNET(torch.nn.Module):
         # Apply positional encoding
         pe_x = self.positional_encoding(base_x)
         
-        # Determine sequence complexity ratio
-        sequence_length_ratio = min(1.0, seq_len / self.long_threshold)
+        # Unified Dual-Scale Temporal Processing
+        temporal_features = self.temporal_encoder(pe_x)
         
-        # Adaptive processing based on sequence length
-        if seq_len <= self.short_threshold:
-            # Short sequence: Enhanced processing
-            processed_features, _, _ = self.adaptive_processor(pe_x)
-            
-            # Use only initial encoder layers for short sequences
-            encoded_x = processed_features
-            for i in range(min(3, len(self.encoder_layers))):  # Increased to 3 layers
-                encoded_x = self.encoder_layers[i](encoded_x)
-            
-        elif seq_len <= self.medium_threshold:
-            # Medium sequence: Balanced processing
-            processed_features, _, _ = self.adaptive_processor(pe_x)
-            hierarchical_features = self.hierarchical_encoder(processed_features, sequence_length_ratio)
-            
-            # Integrate adaptive and hierarchical features
-            integrated_features = self.context_integration(
-                torch.cat([processed_features, hierarchical_features], dim=-1)
-            )
-            
-            # Standard encoder processing
-            encoded_x = integrated_features
-            for layer in self.encoder_layers:
-                encoded_x = layer(encoded_x)
-            
-        else:
-            # Long sequence: Full hierarchical processing
-            hierarchical_features = self.hierarchical_encoder(pe_x, sequence_length_ratio)
-            processed_features, _, _ = self.adaptive_processor(hierarchical_features)
-            
-            # Integrate features
-            integrated_features = self.context_integration(
-                torch.cat([hierarchical_features, processed_features], dim=-1)
-            )
-            
-            # Full encoder processing
-            encoded_x = integrated_features
-            for layer in self.encoder_layers:
-                encoded_x = layer(encoded_x)
+        # Standard encoder processing
+        encoded_x = temporal_features
+        for layer in self.encoder_layers:
+            encoded_x = layer(encoded_x)
         
         # Apply encoder normalization
         encoded_x = self.encoder_norm(encoded_x)
