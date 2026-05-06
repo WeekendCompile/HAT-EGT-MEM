@@ -39,10 +39,11 @@ def train_one_epoch(opt, model, train_dataset, optimizer, warmup=False):
     epoch_cost = 0
     epoch_cost_cls = 0
     epoch_cost_reg = 0
+    epoch_cost_mem = 0
     
     total_iter = len(train_dataset)//opt['batch_size']
     
-    for n_iter,(input_data,cls_label,reg_label,_) in enumerate(tqdm(train_loader)):
+    for n_iter,(input_data,cls_label,reg_label,snip_label) in enumerate(tqdm(train_loader)):
 
         if warmup:
             for g in optimizer.param_groups:
@@ -52,8 +53,9 @@ def train_one_epoch(opt, model, train_dataset, optimizer, warmup=False):
         input_data = input_data.float().cuda()
         cls_label = cls_label.cuda()
         reg_label = reg_label.cuda()
+        snip_label = snip_label.cuda()
         
-        act_cls, act_reg = model(input_data)
+        act_cls, act_reg, mem_cls = model(input_data)
         
         cost_reg = 0
         cost_cls = 0
@@ -65,9 +67,14 @@ def train_one_epoch(opt, model, train_dataset, optimizer, warmup=False):
                
         loss = regress_loss_func(reg_label, act_reg)
         cost_reg = loss  
-        epoch_cost_reg += cost_reg.detach().cpu().item()   
+        epoch_cost_reg += cost_reg.detach().cpu().item()
         
-        cost = opt['alpha']*cost_cls + opt['beta']*cost_reg    
+        # LMU auxiliary memory loss: ensures memory tokens encode meaningful actions
+        loss = cls_loss_func(snip_label, mem_cls, use_focal=True)
+        cost_mem = loss
+        epoch_cost_mem += cost_mem.detach().cpu().item()
+        
+        cost = opt['alpha']*cost_cls + opt['beta']*cost_reg + opt['gamma']*cost_mem
                 
         epoch_cost += cost.detach().cpu().item() 
 
@@ -75,7 +82,7 @@ def train_one_epoch(opt, model, train_dataset, optimizer, warmup=False):
         cost.backward()
         optimizer.step()   
                 
-    return n_iter, epoch_cost, epoch_cost_cls, epoch_cost_reg
+    return n_iter, epoch_cost, epoch_cost_cls, epoch_cost_reg, epoch_cost_mem
 
 def eval_one_epoch(opt, model, test_dataset):
     cls_loss, reg_loss, tot_loss, output_cls, output_reg, labels_cls, labels_reg, working_time, total_frames = eval_frame(opt, model, test_dataset)
@@ -128,13 +135,14 @@ def train(opt):
             warmup = False
         
         model.train()
-        n_iter, epoch_cost, epoch_cost_cls, epoch_cost_reg = train_one_epoch(opt, model, train_dataset, optimizer, warmup)
+        n_iter, epoch_cost, epoch_cost_cls, epoch_cost_reg, epoch_cost_mem = train_one_epoch(opt, model, train_dataset, optimizer, warmup)
             
         writer.add_scalars('data/cost', {'train': epoch_cost/(n_iter+1)}, n_epoch)
-        print("training loss(epoch %d): %.03f, cls - %f, reg - %f, lr - %f"%(n_epoch,
+        print("training loss(epoch %d): %.03f, cls - %f, reg - %f, mem - %f, lr - %f"%(n_epoch,
                                                                             epoch_cost/(n_iter+1),
                                                                             epoch_cost_cls/(n_iter+1),
                                                                             epoch_cost_reg/(n_iter+1),
+                                                                            epoch_cost_mem/(n_iter+1),
                                                                             optimizer.param_groups[-1]["lr"]))
         
         scheduler.step()
@@ -204,7 +212,7 @@ def eval_frame(opt, model, dataset):
         cls_label = cls_label.cuda()
         reg_label = reg_label.cuda()
         
-        act_cls, act_reg = model(input_data)
+        act_cls, act_reg, _ = model(input_data)
         cost_reg = 0
         cost_cls = 0
         
@@ -522,7 +530,7 @@ def test_online(opt):
             
             minput = input_queue.unsqueeze(0)
             with torch.no_grad():
-                act_cls, act_reg = model(minput.cuda())
+                act_cls, act_reg, _ = model(minput.cuda())
                 act_cls = torch.softmax(act_cls, dim=-1)
             
             cls_anc = act_cls.squeeze(0).detach().cpu().numpy()

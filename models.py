@@ -23,6 +23,14 @@ class PositionalEncoding(nn.Module):
         return self.dropout(token_embedding + self.pos_embedding[:token_embedding.size(0), :])
 
 
+# ---------------------------------------------------------------------------
+# Module 1: Dual-Scale Temporal Encoder
+# ---------------------------------------------------------------------------
+# Captures both fine-grained local motion patterns (via depthwise 1D
+# convolutions) and long-range temporal dependencies (via self-attention)
+# through a unified local-global feature extraction mechanism.
+# Operates on the FULL temporal sequence before any split.
+# ---------------------------------------------------------------------------
 class DualScaleTemporalEncoder(nn.Module):
     """
     Unified temporal encoder that captures both fine-grained local motion 
@@ -78,6 +86,85 @@ class DualScaleTemporalEncoder(nn.Module):
         
         return fused
 
+
+# ---------------------------------------------------------------------------
+# Module 2: Long-Range Memory Unit (LMU)
+# ---------------------------------------------------------------------------
+# Introduces a targeted mechanism for context retention and retrieval.
+# After multi-scale encoding, the long-range context portion of the
+# temporal sequence is compressed into a compact set of learnable memory
+# tokens via cross-attention. A content-aware gate selectively weights
+# task-relevant information. An auxiliary classification head ensures
+# the memory tokens encode meaningful action semantics via direct
+# gradient supervision.
+#
+# Unlike naive approaches that stack redundant layers or increase
+# parameter count, the LMU serves a clear functional role: preserving
+# and structuring long-horizon context to guide current-window predictions.
+# ---------------------------------------------------------------------------
+class LongRangeMemoryUnit(nn.Module):
+    """
+    Compresses long-range encoded context into compact memory tokens via
+    cross-attention, applies content-aware gating, and produces auxiliary
+    classification for direct gradient supervision.
+    """
+    def __init__(self, embedding_dim, num_classes, n_memory_tokens=8,
+                 n_heads=4, n_layers=2, dropout=0.3):
+        super(LongRangeMemoryUnit, self).__init__()
+        self.n_memory_tokens = n_memory_tokens
+        
+        # Learnable memory query tokens
+        self.memory_tokens = nn.Parameter(
+            torch.zeros(n_memory_tokens, 1, embedding_dim))
+        nn.init.normal_(self.memory_tokens, std=0.02)
+        
+        # Cross-attention compressor: memory tokens attend to context features
+        self.memory_compressor = nn.TransformerDecoder(
+            nn.TransformerDecoderLayer(
+                d_model=embedding_dim, nhead=n_heads,
+                dropout=dropout, activation='gelu'),
+            num_layers=n_layers,
+            norm=nn.LayerNorm(embedding_dim))
+        
+        # Content-aware gate conditioned on context summary
+        self.memory_gate = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim // 4),
+            nn.GELU(),
+            nn.Linear(embedding_dim // 4, embedding_dim),
+            nn.Sigmoid())
+        
+        # Auxiliary classification head for direct gradient supervision
+        self.memory_head = nn.Sequential(
+            nn.Linear(n_memory_tokens * embedding_dim, embedding_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embedding_dim, num_classes))
+
+    def forward(self, context_x):
+        """
+        context_x: [context_len, batch, dim] — long-range encoded features
+        Returns:
+            memory_out: [n_memory_tokens, batch, dim] — compressed memory
+            memory_cls: [batch, num_classes] — auxiliary classification
+        """
+        batch = context_x.shape[1]
+        
+        # Cross-attention compression: memory tokens query the context
+        mem_tokens = self.memory_tokens.expand(-1, batch, -1)
+        memory_out = self.memory_compressor(mem_tokens, context_x)
+        
+        # Content-aware gating: selectively weight memory dimensions
+        context_summary = context_x.mean(dim=0)           # [batch, dim]
+        gate = self.memory_gate(context_summary)           # [batch, dim]
+        memory_out = memory_out * gate.unsqueeze(0)        # [n_tokens, batch, dim]
+        
+        # Auxiliary classification on compressed memory
+        mem_flat = memory_out.permute(1, 0, 2).reshape(batch, -1)
+        memory_cls = self.memory_head(mem_flat)             # [batch, num_classes]
+        
+        return memory_out, memory_cls
+
+
 class MYNET(torch.nn.Module):
     def __init__(self, opt):
         super(MYNET, self).__init__()
@@ -91,11 +178,12 @@ class MYNET(torch.nn.Module):
         n_seglen = opt["segment_size"]
         self.anchors = opt["anchors"]
         self.anchors_stride = []
+        self.short_window_size = 16  # Current prediction window
         dropout = 0.3
         self.best_loss = 1000000
         self.best_map = 0
         
-        # Enhanced feature reduction with dynamic dropout
+        # ---- Stage 0: Modality-Specific Feature Reduction ----
         self.feature_reduction_rgb = nn.Sequential(
             nn.Linear(self.n_feature//2, n_embedding_dim//2),
             nn.GELU(),
@@ -109,7 +197,8 @@ class MYNET(torch.nn.Module):
             nn.Dropout(dropout * 0.5)
         )
         
-        # Positional encoding
+        # ---- Stage 1: Full-Sequence Temporal Encoding ----
+        # Positional encoding for the full temporal sequence
         self.positional_encoding = PositionalEncoding(
             n_embedding_dim, 
             dropout=dropout * 0.5,
@@ -117,25 +206,36 @@ class MYNET(torch.nn.Module):
             scale_factor=0.5
         )
         
-        # Unified Dual-Scale Temporal Encoder
+        # Dual-Scale Temporal Encoder: local conv + global attention
         self.temporal_encoder = DualScaleTemporalEncoder(
             embedding_dim=n_embedding_dim,
             num_heads=n_enc_head,
             dropout=dropout
         )
         
-        # Main encoder (adaptive layers)
+        # Standard encoder stack with progressive dropout
         self.encoder_layers = nn.ModuleList([
             nn.TransformerEncoderLayer(
                 d_model=n_embedding_dim, 
                 nhead=n_enc_head, 
-                dropout=dropout * (0.5 if i < 2 else 1.0),  # Lower dropout for initial layers
+                dropout=dropout * (0.5 if i < 2 else 1.0),
                 activation='gelu'
             ) for i in range(n_enc_layer)
         ])
         self.encoder_norm = nn.LayerNorm(n_embedding_dim)
         
-        # Decoder
+        # ---- Stage 2: Long-Range Memory Unit ----
+        # Compresses context region into compact memory tokens
+        self.memory_unit = LongRangeMemoryUnit(
+            embedding_dim=n_embedding_dim,
+            num_classes=n_class,
+            n_memory_tokens=8,
+            n_heads=n_dec_head,
+            n_layers=2,
+            dropout=dropout
+        )
+        
+        # ---- Stage 3: Anchor Decoder (full sequence + memory) ----
         self.decoder = nn.TransformerDecoder(
             nn.TransformerDecoderLayer(
                 d_model=n_embedding_dim, 
@@ -147,9 +247,13 @@ class MYNET(torch.nn.Module):
             nn.LayerNorm(n_embedding_dim)
         )
         
-
+        self.decoder_token = nn.Parameter(torch.Tensor(len(self.anchors), 1, n_embedding_dim))
+        nn.init.normal_(self.decoder_token, std=0.01)
         
-        # Enhanced classification and regression heads
+        self.decoder_norm = nn.LayerNorm(n_embedding_dim)
+        self.decoder_dropout = nn.Dropout(dropout)
+        
+        # ---- Stage 4: Prediction Heads ----
         self.classifier = nn.Sequential(
             nn.Linear(n_embedding_dim, n_embedding_dim), 
             nn.GELU(), 
@@ -164,57 +268,51 @@ class MYNET(torch.nn.Module):
             nn.Dropout(dropout),
             nn.Linear(n_embedding_dim, 2)
         )
-        
-        self.decoder_token = nn.Parameter(torch.Tensor(len(self.anchors), 1, n_embedding_dim))
-        nn.init.normal_(self.decoder_token, std=0.01)
-        
-        # Additional normalization layers
-        self.norm1 = nn.LayerNorm(n_embedding_dim)
-        self.norm2 = nn.LayerNorm(n_embedding_dim)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-        
-        self.relu = nn.ReLU(True)
-        self.softmaxd1 = nn.Softmax(dim=-1)
 
     def forward(self, inputs):
-        # Enhanced feature processing
+        # ---- Stage 0: Modality-specific feature reduction ----
         inputs = inputs.float()
         base_x_rgb = self.feature_reduction_rgb(inputs[:,:,:self.n_feature//2])
         base_x_flow = self.feature_reduction_flow(inputs[:,:,self.n_feature//2:])
         base_x = torch.cat([base_x_rgb, base_x_flow], dim=-1)
         
-        base_x = base_x.permute([1,0,2])  # seq_len x batch x featsize
-        seq_len = base_x.shape[0]
+        base_x = base_x.permute([1,0,2])  # [seq_len, batch, dim]
         
-        # Apply positional encoding
+        # ---- Stage 1: Full-sequence temporal encoding ----
+        # All frames benefit from multi-scale encoding before any split
         pe_x = self.positional_encoding(base_x)
-        
-        # Unified Dual-Scale Temporal Processing
         temporal_features = self.temporal_encoder(pe_x)
         
-        # Standard encoder processing
         encoded_x = temporal_features
         for layer in self.encoder_layers:
             encoded_x = layer(encoded_x)
-        
-        # Apply encoder normalization
         encoded_x = self.encoder_norm(encoded_x)
-        encoded_x = self.norm1(encoded_x)
         
-        # Decoder processing
+        # ---- Stage 2: Long-Range Memory Unit ----
+        # Compress the long-range context portion into compact memory tokens.
+        # The context region (first 48 frames) is further from the prediction
+        # point and benefits most from structured compression.
+        context_x = encoded_x[:-self.short_window_size]   # [48, B, D]
+        memory_out, memory_cls = self.memory_unit(context_x)
+        
+        # ---- Stage 3: Memory-augmented anchor decoding ----
+        # The decoder attends to the FULL encoded sequence PLUS the
+        # compressed memory tokens. This preserves all original temporal
+        # information while providing structured long-range summaries
+        # as additional keys/values for the anchor queries.
+        decoder_memory = torch.cat([encoded_x, memory_out], dim=0)  # [64+8, B, D]
+        
         decoder_token = self.decoder_token.expand(-1, encoded_x.shape[1], -1)
-        decoded_x = self.decoder(decoder_token, encoded_x)
+        decoded_x = self.decoder(decoder_token, decoder_memory)
+        decoded_x = self.decoder_norm(decoded_x + self.decoder_dropout(decoder_token))
         
-        # Add residual connection and normalization
-        decoded_x = self.norm2(decoded_x + self.dropout1(decoder_token))
+        decoded_x = decoded_x.permute([1, 0, 2])  # [B, n_anchors, D]
         
-        decoded_x = decoded_x.permute([1, 0, 2])
-        
+        # ---- Stage 4: Prediction ----
         anc_cls = self.classifier(decoded_x)
         anc_reg = self.regressor(decoded_x)
         
-        return anc_cls, anc_reg
+        return anc_cls, anc_reg, memory_cls
 
 
 class SuppressNet(torch.nn.Module):
@@ -244,4 +342,3 @@ class SuppressNet(torch.nn.Module):
         x = x.squeeze(-1)
         
         return x
-
