@@ -44,7 +44,7 @@ class VideoDataSet(data.Dataset):
         self.subset = subset
         self.mode = opt["mode"]
         self.predefined_fps = opt["predefined_fps"]
-        self.video_anno_path = opt["video_anno"]        
+        self.video_anno_path = opt["video_anno"].format(opt["split"])          
         self.video_len_path = opt["video_len_file"].format(self.subset+'_'+opt["setup"])        
         self.num_of_class = opt["num_of_class"]
         self.segment_size = opt["segment_size"]
