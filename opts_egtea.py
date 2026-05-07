@@ -139,6 +139,21 @@ def parse_opt():
         type=float,
         default=0.2)
     parser.add_argument(
+        '--use_memory',
+        default=False,
+        action='store_true',
+        help='Enable MemoryUnit (RAGM) before DSTE. Off by default to preserve current 22.15 baseline.')
+    parser.add_argument(
+        '--num_memory_slots',
+        type=int,
+        default=16,
+        help='Number of slots in the MemoryUnit content-addressable bank.')
+    parser.add_argument(
+        '--gamma_mem',
+        type=float,
+        default=0.2,
+        help='Weight for the MemoryUnit auxiliary snippet-classification loss.')
+    parser.add_argument(
         '--pptype',
         type=str,
         default="net")
