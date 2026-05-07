@@ -16,7 +16,7 @@ from eval import evaluation_detection
 from tensorboardX import SummaryWriter
 from dataset import VideoDataSet
 from models import MYNET, SuppressNet
-from loss_func import cls_loss_func, regress_loss_func
+from loss_func import cls_loss_func, regress_loss_func, MultiCrossEntropyLoss
 from functools import *
 
 def setup_multi_gpu():
@@ -35,54 +35,62 @@ def train_one_epoch(opt, model, train_dataset, optimizer, warmup=False):
     train_loader = torch.utils.data.DataLoader(train_dataset,
                                                 batch_size=opt['batch_size'], shuffle=True,
                                                 num_workers=num_workers, pin_memory=True,
-                                                drop_last=False)      
+                                                drop_last=False)
     epoch_cost = 0
     epoch_cost_cls = 0
     epoch_cost_reg = 0
-    epoch_cost_mem = 0
-    
+    epoch_cost_snip = 0
+
+    use_memory = opt.get('use_memory', False)
+    snip_loss_fn = MultiCrossEntropyLoss(focal=True) if use_memory else None
+
     total_iter = len(train_dataset)//opt['batch_size']
-    
-    for n_iter,(input_data,cls_label,reg_label,snip_label) in enumerate(tqdm(train_loader)):
+
+    for n_iter, (input_data, cls_label, reg_label, snip_label) in enumerate(tqdm(train_loader)):
 
         if warmup:
             for g in optimizer.param_groups:
                 g['lr'] = n_iter * (opt['lr']) / total_iter
-        
+
         # Move data to GPU (DataParallel will handle distribution)
         input_data = input_data.float().cuda()
         cls_label = cls_label.cuda()
         reg_label = reg_label.cuda()
-        snip_label = snip_label.cuda()
-        
-        act_cls, act_reg, mem_cls = model(input_data)
-        
+
+        outputs = model(input_data)
+        if use_memory:
+            act_cls, act_reg, snip_cls = outputs
+        else:
+            act_cls, act_reg = outputs
+            snip_cls = None
+
         cost_reg = 0
         cost_cls = 0
 
         loss = cls_loss_func(cls_label, act_cls, use_focal=True)
         cost_cls = loss
-            
-        epoch_cost_cls += cost_cls.detach().cpu().item()    
-               
+
+        epoch_cost_cls += cost_cls.detach().cpu().item()
+
         loss = regress_loss_func(reg_label, act_reg)
-        cost_reg = loss  
+        cost_reg = loss
         epoch_cost_reg += cost_reg.detach().cpu().item()
-        
-        # LMU auxiliary memory loss: ensures memory tokens encode meaningful actions
-        loss = cls_loss_func(snip_label, mem_cls, use_focal=True)
-        cost_mem = loss
-        epoch_cost_mem += cost_mem.detach().cpu().item()
-        
-        cost = opt['alpha']*cost_cls + opt['beta']*cost_reg + opt['gamma']*cost_mem
-                
-        epoch_cost += cost.detach().cpu().item() 
+
+        cost = opt['alpha']*cost_cls + opt['beta']*cost_reg
+
+        if use_memory and snip_cls is not None:
+            snip_label_cu = snip_label.float().cuda()
+            cost_snip = snip_loss_fn(snip_cls, snip_label_cu)
+            epoch_cost_snip += cost_snip.detach().cpu().item()
+            cost = cost + opt['gamma_mem'] * cost_snip
+
+        epoch_cost += cost.detach().cpu().item()
 
         optimizer.zero_grad()
         cost.backward()
-        optimizer.step()   
-                
-    return n_iter, epoch_cost, epoch_cost_cls, epoch_cost_reg, epoch_cost_mem
+        optimizer.step()
+
+    return n_iter, epoch_cost, epoch_cost_cls, epoch_cost_reg, epoch_cost_snip
 
 def eval_one_epoch(opt, model, test_dataset):
     cls_loss, reg_loss, tot_loss, output_cls, output_reg, labels_cls, labels_reg, working_time, total_frames = eval_frame(opt, model, test_dataset)
@@ -135,15 +143,16 @@ def train(opt):
             warmup = False
         
         model.train()
-        n_iter, epoch_cost, epoch_cost_cls, epoch_cost_reg, epoch_cost_mem = train_one_epoch(opt, model, train_dataset, optimizer, warmup)
-            
+        n_iter, epoch_cost, epoch_cost_cls, epoch_cost_reg, epoch_cost_snip = train_one_epoch(opt, model, train_dataset, optimizer, warmup)
+
         writer.add_scalars('data/cost', {'train': epoch_cost/(n_iter+1)}, n_epoch)
-        print("training loss(epoch %d): %.03f, cls - %f, reg - %f, mem - %f, lr - %f"%(n_epoch,
-                                                                            epoch_cost/(n_iter+1),
-                                                                            epoch_cost_cls/(n_iter+1),
-                                                                            epoch_cost_reg/(n_iter+1),
-                                                                            epoch_cost_mem/(n_iter+1),
-                                                                            optimizer.param_groups[-1]["lr"]))
+        print("training loss(epoch %d): %.03f, cls - %f, reg - %f, snip - %f, lr - %f" % (
+            n_epoch,
+            epoch_cost/(n_iter+1),
+            epoch_cost_cls/(n_iter+1),
+            epoch_cost_reg/(n_iter+1),
+            epoch_cost_snip/(n_iter+1),
+            optimizer.param_groups[-1]["lr"]))
         
         scheduler.step()
         model.eval()
@@ -206,13 +215,18 @@ def eval_frame(opt, model, dataset):
     epoch_cost_cls = 0
     epoch_cost_reg = 0   
     
+    use_memory = opt.get('use_memory', False)
     for n_iter, (input_data, cls_label, reg_label, _) in enumerate(tqdm(test_loader)):
         # Move data to GPU
         input_data = input_data.float().cuda()
         cls_label = cls_label.cuda()
         reg_label = reg_label.cuda()
-        
-        act_cls, act_reg, _ = model(input_data)
+
+        outputs = model(input_data)
+        if use_memory:
+            act_cls, act_reg, _ = outputs
+        else:
+            act_cls, act_reg = outputs
         cost_reg = 0
         cost_cls = 0
         
@@ -530,7 +544,11 @@ def test_online(opt):
             
             minput = input_queue.unsqueeze(0)
             with torch.no_grad():
-                act_cls, act_reg, _ = model(minput.cuda())
+                outputs = model(minput.cuda())
+                if opt.get('use_memory', False):
+                    act_cls, act_reg, _ = outputs
+                else:
+                    act_cls, act_reg = outputs
                 act_cls = torch.softmax(act_cls, dim=-1)
             
             cls_anc = act_cls.squeeze(0).detach().cpu().numpy()
